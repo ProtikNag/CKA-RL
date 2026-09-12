@@ -36,6 +36,7 @@ METHOD_NAMES = {
     "CReLUs": "CReLUs",
     "MaskNet": "MaskNet",
     "CbpNet": "CbpNet",
+    "Ours": "Ours",
 }
 
 def get_available_methods(data):
