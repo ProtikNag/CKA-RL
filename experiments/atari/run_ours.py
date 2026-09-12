@@ -136,16 +136,34 @@ def parse_args():
     p.add_argument("--resume", action="store_true",
                    help="resume from the last completed task boundary in this tag "
                         "(reads run_state.json + global_after_task{k}.)")
+    p.add_argument("--vector-env", type=str, default="async", choices=["async", "sync"],
+                   help="training rollout vector-env backend; async parallelizes the "
+                        "8 emulators across cores (Atari is env-bound) -- pure speedup")
+    p.add_argument("--consolidate-mode", type=str, default="all", choices=["all", "needy"],
+                   help="global-phase past-task set each iter: 'all' seen modes "
+                        "(canonical) or 'needy' = only modes below the retention bar "
+                        "(+ current task) -- the targeted/selective-consolidation variant")
     p.add_argument("--cuda", type=lambda v: str(v).lower() in ("1", "true", "yes", "y"),
                    default=True)
     p.add_argument("--debug", action="store_true")
     return p.parse_args()
 
 
-def build_envs(env_id, mode, seed, run_name):
-    envs = gym.vector.SyncVectorEnv(
-        [make_env(env_id, i, False, run_name, mode=mode) for i in range(NUM_ENVS)]
-    )
+# Vector-env backend for TRAINING rollouts. "async" runs the NUM_ENVS emulators
+# in parallel worker processes (Atari here is env/CPU-bound, so this is a pure
+# wall-clock speedup -- identical algorithm/batch as sync, just faster stepping).
+# Set from --vector-env in main(). Eval builds pass kind="sync" (short rollouts,
+# not worth the per-call worker spawn/teardown).
+VECTOR_ENV = "async"
+
+
+def build_envs(env_id, mode, seed, run_name, kind=None):
+    kind = kind or VECTOR_ENV
+    thunks = [make_env(env_id, i, False, run_name, mode=mode) for i in range(NUM_ENVS)]
+    if kind == "async":
+        envs = gym.vector.AsyncVectorEnv(thunks)
+    else:
+        envs = gym.vector.SyncVectorEnv(thunks)
     assert isinstance(envs.single_action_space, gym.spaces.Discrete)
     return envs
 
@@ -237,7 +255,7 @@ def greedy_eval(agent, env_id, mode, task_idx, seed, n_episodes, device):
     unaffected by ClipReward which only affects the reward signal, not the
     'episode' stat which records the *clipped* env reward here. We simply report
     what the wrapper gives -- consistent across all policies compared)."""
-    envs = build_envs(env_id, mode, seed + 12345, f"eval_{mode}")
+    envs = build_envs(env_id, mode, seed + 12345, f"eval_{mode}", kind="sync")
     returns = []
     next_obs, _ = envs.reset(seed=seed + 12345)
     next_obs = torch.Tensor(next_obs).to(device)
@@ -267,7 +285,7 @@ def mc_stochastic_value(agent, env_id, mode, task_idx, seed, n_episodes, device)
     training reward scale, NOT the undiscounted game score. The per-env running
     discounted return is disc[e] += gpow[e]*reward[e]; gpow[e] *= GAMMA, reset
     when env e's episode ends."""
-    envs = build_envs(env_id, mode, seed + 777, f"mc_{mode}")
+    envs = build_envs(env_id, mode, seed + 777, f"mc_{mode}", kind="sync")
     returns = []
     disc = np.zeros(NUM_ENVS, dtype=np.float64)   # running discounted return per env
     gpow = np.ones(NUM_ENVS, dtype=np.float64)    # gamma^t per env
@@ -493,19 +511,55 @@ def train_global_phase(agent, local_agent, env_id, modes, seen_idx, k,
     `constraint_every` iterations; between refreshes the held shortfall_k is used
     so the 16-episode MC does not run every iteration.
     """
-    run_names = {i: f"global_{modes[i]}_{i}" for i in seen_idx}
-    envs_by_idx = {i: build_envs(env_id, modes[i], seed + 1000 + i, run_names[i])
-                   for i in seen_idx}
-    state_by_idx = {}
-    gstep_by_idx = {i: 0 for i in seen_idx}
-    for i in seen_idx:
-        no, _ = envs_by_idx[i].reset(seed=seed + 1000 + i)
+    # consolidate-mode: 'all' rolls out every seen mode each iteration (canonical
+    # min-max); 'needy' rolls out only past modes currently BELOW their retention
+    # bar (+ the current task, always) -- the targeted/selective-consolidation
+    # variant: cost per iteration ~ |active| not |seen|, and envs are managed
+    # lazily so only |active| emulators are open at once (memory + speed).
+    needy_mode = (getattr(args, "consolidate_mode", "all") == "needy")
+    past = [i for i in seen_idx if i < k]
+
+    envs_by_idx, state_by_idx, gstep_by_idx = {}, {}, {}
+
+    def open_env(i):
+        e = build_envs(env_id, modes[i], seed + 1000 + i, f"global_{modes[i]}_{i}")
+        no, _ = e.reset(seed=seed + 1000 + i)
+        envs_by_idx[i] = e
         state_by_idx[i] = (torch.Tensor(no).to(device), torch.zeros(NUM_ENVS).to(device))
+        gstep_by_idx.setdefault(i, 0)
+
+    def set_active(active):
+        for i in active:
+            if i not in envs_by_idx:
+                open_env(i)
+        for i in list(envs_by_idx.keys()):
+            if i not in active:            # close modes that left the active set
+                envs_by_idx[i].close()
+                del envs_by_idx[i]
+                state_by_idx.pop(i, None)
+
+    def greedy_scores_all():
+        return {i: greedy_eval(agent, env_id, modes[i], i, seed,
+                               args.stop_eval_episodes, device) for i in seen_idx}
+
+    def needy_past(scores):
+        return [i for i in past if scores[i] < args.retention_frac * local_refs[i]]
+
+    # ---- initial active set ----
+    if needy_mode:
+        active_past = needy_past(greedy_scores_all())
+    else:
+        active_past = list(past)
+    active = active_past + [k]
+    set_active(active)
+    logger.info(f"[global k={k}] consolidate={'needy' if needy_mode else 'all'} "
+                f"initial active modes={[modes[i] for i in active]}")
 
     optimizer = optim.Adam(agent.parameters(), lr=LR, eps=1e-5)
 
-    # fixed global-phase iteration count (each iteration rolls out ALL seen modes,
-    # so total frames grow with #tasks -- the disclosed asymmetry, by design)
+    # fixed global-phase iteration count (each iteration rolls out the ACTIVE modes;
+    # in 'all' mode active == all seen, so frames grow with #tasks -- the disclosed
+    # asymmetry; in 'needy' mode frames ~ #forgetting modes)
     num_iterations = args.global_iters
     mu = 0.0  # reset each task's global phase
     consec_ok = 0
@@ -532,9 +586,9 @@ def train_global_phase(agent, local_agent, env_id, modes, seen_idx, k,
         frac = 1.0 - (iteration - 1.0) / num_iterations
         optimizer.param_groups[0]["lr"] = frac * LR
 
-        # ---- roll out every seen mode with current global ----
+        # ---- roll out the ACTIVE modes with the current global ----
         batches = {}
-        for i in seen_idx:
+        for i in active:
             no, nd = state_by_idx[i]
             logs_local = {"global_step": [], "episodic_return": []}
             batches[i], no, nd, gstep_by_idx[i] = collect_rollout(
@@ -562,29 +616,32 @@ def train_global_phase(agent, local_agent, env_id, modes, seen_idx, k,
             logger.info(f"[global k={k}] it={iteration} shortfall={shortfall_k:.3f} "
                         f"Vk_G={Vk_G:.3f} mu={mu:.4f}")
 
-        # ---- actor coefficients (from currently-held shortfall_k + mu) ----
+        # ---- actor coefficients over the ACTIVE set (held shortfall_k + mu) ----
+        # Past active modes keep their true objective weight 1/(k+1); the current
+        # task gets mu*2*shortfall. Retained (inactive) past modes contribute 0
+        # this iteration (they are at/above their bar, ~zero retention gradient).
         coeffs = {}
-        for i in seen_idx:
+        for i in active:
             if i < k:
-                coeffs[i] = 1.0 / (k + 1)    # 1/(total tasks seen) = 1/|seen_idx|
+                coeffs[i] = 1.0 / (k + 1)    # 1/(total tasks seen)
             else:
                 coeffs[i] = mu * 2.0 * shortfall_k
         Z = sum(coeffs.values())
         if Z <= 0:
-            # degenerate (mu=0 and no past, or all-zero): fall back to uniform
-            for i in seen_idx:
-                coeffs[i] = 1.0 / len(seen_idx)
+            # degenerate (mu=0 and no active past): fall back to uniform over active
+            for i in active:
+                coeffs[i] = 1.0 / len(active)
             Z = 1.0
-        norm_coeffs = {i: coeffs[i] / Z for i in seen_idx}
+        norm_coeffs = {i: coeffs[i] / Z for i in active}
 
         # ---- PPO update: normalized actor CL term + standard critic/entropy ----
         for epoch in range(UPDATE_EPOCHS):
-            inds_by_idx = {i: np.random.permutation(BATCH_SIZE) for i in seen_idx}
+            inds_by_idx = {i: np.random.permutation(BATCH_SIZE) for i in active}
             for start in range(0, BATCH_SIZE, MINIBATCH_SIZE):
                 total_actor = 0.0
                 total_critic = 0.0
                 total_entropy = 0.0
-                for i in seen_idx:
+                for i in active:
                     mb_inds = inds_by_idx[i][start:start + MINIBATCH_SIZE]
                     pg_loss, v_loss, entropy_loss = ppo_losses_for_batch(
                         agent, batches[i], i, mb_inds, device
@@ -611,7 +668,8 @@ def train_global_phase(agent, local_agent, env_id, modes, seen_idx, k,
                               consolidation_steps=done_steps, sps=sps, mu=round(mu, 5),
                               shortfall=round(shortfall_k, 4), Vk_L=round(Vk_L, 3),
                               Vk_G=round(Vk_G, 3),
-                              actor_coeffs={int(modes[i]): round(norm_coeffs[i], 4) for i in seen_idx},
+                              actor_coeffs={int(modes[i]): round(norm_coeffs[i], 4) for i in active},
+                              active_modes=[int(modes[i]) for i in active],
                               pg_loss=round(last["pg"], 5), v_loss=round(last["v"], 5),
                               entropy=round(last["ent"], 4))
             frac_done = iteration / num_iterations
@@ -623,38 +681,47 @@ def train_global_phase(agent, local_agent, env_id, modes, seen_idx, k,
                             phase_elapsed_sec=round(time.time() - t0, 1),
                             phase_eta_sec=round((time.time() - t0) * (1 - frac_done) / max(1e-9, frac_done), 1),
                             seen_modes=[int(modes[i]) for i in seen_idx],
+                            active_modes=[int(modes[i]) for i in active],
                             local_refs={int(modes[i]): round(local_refs[i], 3) for i in seen_idx})
         if reporter is not None and ckpt_every and iteration % ckpt_every == 0:
             reporter.checkpoint(agent, f"global_ckpt_task{k}_latest")
 
-        # ---- retention-gated early stop (only after the min_iters floor) ----
-        if iteration >= args.min_iters and iteration % args.stop_eval_every == 0:
-            all_ok = True
-            scores = {}
-            for i in seen_idx:
-                g = greedy_eval(agent, env_id, modes[i], i, seed,
-                                args.stop_eval_episodes, device)
-                scores[int(modes[i])] = round(g, 3)
-                thr = args.retention_frac * local_refs[i]
-                if g < thr:
-                    all_ok = False
-            consec_ok = consec_ok + 1 if all_ok else 0
+        # ---- retention check (all seen) -> needy-set refresh + gated early stop ----
+        # Runs every stop_eval_every iters. The cheap greedy scores serve BOTH the
+        # 'needy' active-set refresh (regardless of min_iters) and the early-stop
+        # decision (only after the min_iters floor).
+        if iteration % args.stop_eval_every == 0:
+            sc = greedy_scores_all()
+            scores = {int(modes[i]): round(sc[i], 3) for i in seen_idx}
+            all_ok = all(sc[i] >= args.retention_frac * local_refs[i] for i in seen_idx)
+
+            if needy_mode:                     # refresh the active set
+                active_past = needy_past(sc)
+                active = active_past + [k]
+                set_active(active)
+
+            past_min = iteration >= args.min_iters
+            if past_min:
+                consec_ok = consec_ok + 1 if all_ok else 0
             logger.info(f"[global k={k}] it={iteration} retention_all_ok={all_ok} "
-                        f"consec={consec_ok}")
+                        f"consec={consec_ok} active={[modes[i] for i in active]}")
             if reporter is not None:
                 reporter.retention(task=k, iter=iteration, all_ok=bool(all_ok),
                                    consec=consec_ok, greedy_scores=scores,
+                                   active_modes=[int(modes[i]) for i in active],
                                    thresholds={int(modes[i]): round(args.retention_frac * local_refs[i], 3)
                                                for i in seen_idx})
-            if consec_ok >= args.patience:
+            if past_min and consec_ok >= args.patience:
                 logger.info(f"[global k={k}] retention-gated early stop at it={iteration}")
                 break
 
-    for i in seen_idx:
+    for i in list(envs_by_idx.keys()):
         envs_by_idx[i].close()
     if reporter is not None:
         reporter.phase_summary(task=k, phase="global", iters_run=iteration,
+                               consolidate_mode=("needy" if needy_mode else "all"),
                                consolidation_steps=total_consolidation_steps,
+                               final_active_modes=[int(modes[i]) for i in active],
                                mu_final=round(mu, 5), Vk_L=round(Vk_L, 3),
                                Vk_G_last=round(Vk_G, 3), shortfall_last=round(shortfall_k, 4))
     return total_consolidation_steps
@@ -732,7 +799,10 @@ def main():
     torch.manual_seed(args.seed)
     torch.backends.cudnn.deterministic = True
     device = torch.device("cuda" if (torch.cuda.is_available() and args.cuda) else "cpu")
-    logger.info(f"device={device} modes={modes} env={args.env_id} tag={args.tag}")
+    global VECTOR_ENV
+    VECTOR_ENV = args.vector_env
+    logger.info(f"device={device} modes={modes} env={args.env_id} tag={args.tag} "
+                f"vector_env={VECTOR_ENV} consolidate={args.consolidate_mode}")
 
     # build a probe env just for action space to construct the agent
     probe = build_envs(args.env_id, modes[0], args.seed, "probe")

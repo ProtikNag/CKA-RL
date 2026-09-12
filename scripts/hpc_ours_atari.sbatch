@@ -10,7 +10,7 @@
 #SBATCH --error=slurm-ours-atari-%j.err
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
-#SBATCH --cpus-per-task=8
+#SBATCH --cpus-per-task=12
 set -euo pipefail
 
 ENV_ID=${1:?env id e.g. ALE/SpaceInvaders-v5}
