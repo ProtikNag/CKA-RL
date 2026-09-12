@@ -28,7 +28,8 @@ def parse_args():
             "cka-rl",
             "masknet",
             "cbpnet",
-            "crelus"
+            "crelus",
+            "ours"
         ],
         required=True,
     )

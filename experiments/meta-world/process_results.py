@@ -202,7 +202,7 @@ if __name__ == "__main__":
 
     args = parse_args()
     # hardcoded settings
-    methods = ["simple", "componet", "finetune", "prognet", "packnet", "cka-rl", "masknet", "cbpnet", "crelus"]
+    methods = ["simple", "componet", "finetune", "prognet", "packnet", "cka-rl", "masknet", "cbpnet", "crelus", "ours"]
 
     # Extract data from tensorboard results to an actually useful CSV
     args.save_csv = f"data/{args.tag}/extract_results.csv"
