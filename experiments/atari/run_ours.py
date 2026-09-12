@@ -119,11 +119,15 @@ def parse_args():
     p.add_argument("--dual-lr", type=float, default=DUAL_LR)
     p.add_argument("--mu-max", type=float, default=MU_MAX)
     p.add_argument("--retention-frac", type=float, default=RETENTION_FRAC)
-    p.add_argument("--stop-eval-every", type=int, default=50,
-                   help="retention-gated early-stop check cadence (global iters)")
+    p.add_argument("--stop-eval-every", type=int, default=200,
+                   help="retention-gated early-stop check cadence (global iters); "
+                        "atari5 source uses 200")
     p.add_argument("--patience", type=int, default=PATIENCE)
     p.add_argument("--eval-episodes", type=int, default=100,
-                   help="# greedy episodes for reference / retention scores")
+                   help="# greedy episodes for the REPORTED local reference score")
+    p.add_argument("--stop-eval-episodes", type=int, default=3,
+                   help="# greedy episodes for each cheap retention-gate check "
+                        "(atari5 source uses 3; NOT the reported 100)")
     p.add_argument("--log-every", type=int, default=5,
                    help="flush returns.csv + progress.jsonl + status.json every N iterations")
     p.add_argument("--ckpt-every", type=int, default=100,
@@ -629,7 +633,7 @@ def train_global_phase(agent, local_agent, env_id, modes, seen_idx, k,
             scores = {}
             for i in seen_idx:
                 g = greedy_eval(agent, env_id, modes[i], i, seed,
-                                args.eval_episodes, device)
+                                args.stop_eval_episodes, device)
                 scores[int(modes[i])] = round(g, 3)
                 thr = args.retention_frac * local_refs[i]
                 if g < thr:

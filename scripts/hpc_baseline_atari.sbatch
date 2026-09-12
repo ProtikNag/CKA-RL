@@ -20,10 +20,13 @@ LAST=${3:?last mode}
 SEED=${4:-0}
 TAG=${5:-ours_s0}
 
-source /home/pnag/.conda/etc/profile.d/conda.sh
-conda activate cka-rl-atari
+# Prepend the env's bin so BOTH this script AND run_experiments.py's spawned
+# `python run_ppo.py` subprocess resolve to the cka-rl-atari interpreter
+# (conda install is on /work, not /home; no `conda activate` needed).
+export PATH=/home/pnag/.conda/envs/cka-rl-atari/bin:$PATH
 cd /work/pnag/CKA-RL-compare/experiments/atari
 export OMP_NUM_THREADS=${SLURM_CPUS_PER_TASK:-8}
+export TMPDIR=/work/pnag/pip-tmp   # avoid the tiny 2GB /tmp
 
 echo "host=$(hostname) env=$ENV_ID modes=$FIRST..$LAST seed=$SEED tag=$TAG"
 python -c "import torch; print('cuda', torch.cuda.is_available())"
