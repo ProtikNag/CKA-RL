@@ -46,11 +46,32 @@ class SoftQNetwork(nn.Module):
     Kept here (rather than imported from run_sac.py) so models/ours.py has no
     dependency on the training script. Input is [obs, act]; output is a scalar
     Q value. Each task owns two of these (qf1, qf2) plus frozen targets.
+
+    ``use_bn=True`` builds the CrossQ (Bhatt et al., ICLR 2024,
+    arXiv:1902.05605) critic: BatchNorm after every hidden Linear. In CrossQ
+    there is NO target network -- the current and next state-action pairs are
+    forwarded jointly so BatchNorm normalizes both with the same batch
+    statistics. PyTorch BatchNorm ``momentum`` is (1 - paper_momentum), so
+    momentum=0.01 == the paper's 0.99 running-stat momentum. The CrossQ paper
+    uses wider 2048-unit nets; width is kept at 256 here for parity with the
+    SAC baseline (tunable).
     """
 
-    def __init__(self, obs_dim, act_dim):
+    def __init__(self, obs_dim, act_dim, use_bn=False):
         super().__init__()
-        self.fc = shared(int(obs_dim) + int(act_dim))
+        self.use_bn = bool(use_bn)
+        if self.use_bn:
+            in_dim = int(obs_dim) + int(act_dim)
+            self.fc = nn.Sequential(
+                nn.Linear(in_dim, 256),
+                nn.BatchNorm1d(256, momentum=0.01),
+                nn.ReLU(),
+                nn.Linear(256, 256),
+                nn.BatchNorm1d(256, momentum=0.01),
+                nn.ReLU(),
+            )
+        else:
+            self.fc = shared(int(obs_dim) + int(act_dim))
         self.fc_out = nn.Linear(256, 1)
 
     def forward(self, x, a):
@@ -109,39 +130,50 @@ class OursAgent(nn.Module):
     per-task SAC actor losses) is assembled in run_sac_ours.py, not here.
     """
 
-    def __init__(self, obs_dim, act_dim, num_tasks=1):
+    def __init__(self, obs_dim, act_dim, num_tasks=1, crossq=False):
         super().__init__()
         self.obs_dim = int(obs_dim)
         self.act_dim = int(act_dim)
+        self.crossq = bool(crossq)
         self.actor = OursActor(self.obs_dim, self.act_dim, num_tasks=num_tasks)
         self.qf1 = nn.ModuleList(
-            [SoftQNetwork(self.obs_dim, self.act_dim) for _ in range(num_tasks)]
+            [SoftQNetwork(self.obs_dim, self.act_dim, use_bn=self.crossq)
+             for _ in range(num_tasks)]
         )
         self.qf2 = nn.ModuleList(
-            [SoftQNetwork(self.obs_dim, self.act_dim) for _ in range(num_tasks)]
+            [SoftQNetwork(self.obs_dim, self.act_dim, use_bn=self.crossq)
+             for _ in range(num_tasks)]
         )
-        self.qf1_target = nn.ModuleList(
-            [SoftQNetwork(self.obs_dim, self.act_dim) for _ in range(num_tasks)]
-        )
-        self.qf2_target = nn.ModuleList(
-            [SoftQNetwork(self.obs_dim, self.act_dim) for _ in range(num_tasks)]
-        )
-        # initialise targets == online for every initial head
-        for i in range(num_tasks):
-            self.qf1_target[i].load_state_dict(self.qf1[i].state_dict())
-            self.qf2_target[i].load_state_dict(self.qf2[i].state_dict())
+        # CrossQ has NO target networks (joint forward normalizes both state-
+        # action pairs with the same batch stats instead). Skip building them.
+        if self.crossq:
+            self.qf1_target = nn.ModuleList()
+            self.qf2_target = nn.ModuleList()
+        else:
+            self.qf1_target = nn.ModuleList(
+                [SoftQNetwork(self.obs_dim, self.act_dim) for _ in range(num_tasks)]
+            )
+            self.qf2_target = nn.ModuleList(
+                [SoftQNetwork(self.obs_dim, self.act_dim) for _ in range(num_tasks)]
+            )
+            # initialise targets == online for every initial head
+            for i in range(num_tasks):
+                self.qf1_target[i].load_state_dict(self.qf1[i].state_dict())
+                self.qf2_target[i].load_state_dict(self.qf2[i].state_dict())
 
     # ------------------------------------------------------------------ heads
     def ensure_head(self, task_idx):
         """Grow actor heads + critic lists so ``task_idx`` is valid."""
+        crossq = getattr(self, "crossq", False)
         self.actor.ensure_head(task_idx)
         while len(self.qf1) <= task_idx:
-            self.qf1.append(SoftQNetwork(self.obs_dim, self.act_dim))
-            self.qf2.append(SoftQNetwork(self.obs_dim, self.act_dim))
-            self.qf1_target.append(SoftQNetwork(self.obs_dim, self.act_dim))
-            self.qf2_target.append(SoftQNetwork(self.obs_dim, self.act_dim))
-            self.qf1_target[-1].load_state_dict(self.qf1[-1].state_dict())
-            self.qf2_target[-1].load_state_dict(self.qf2[-1].state_dict())
+            self.qf1.append(SoftQNetwork(self.obs_dim, self.act_dim, use_bn=crossq))
+            self.qf2.append(SoftQNetwork(self.obs_dim, self.act_dim, use_bn=crossq))
+            if not crossq:
+                self.qf1_target.append(SoftQNetwork(self.obs_dim, self.act_dim))
+                self.qf2_target.append(SoftQNetwork(self.obs_dim, self.act_dim))
+                self.qf1_target[-1].load_state_dict(self.qf1[-1].state_dict())
+                self.qf2_target[-1].load_state_dict(self.qf2[-1].state_dict())
         device = next(self.actor.fc.parameters()).device
         self.qf1.to(device)
         self.qf2.to(device)
@@ -158,6 +190,8 @@ class OursAgent(nn.Module):
         return self.actor(x, task_idx=task_idx)
 
     def sync_targets(self, task_idx, tau):
+        if getattr(self, "crossq", False):
+            return  # CrossQ has no target networks
         for p, tp in zip(self.qf1[task_idx].parameters(),
                          self.qf1_target[task_idx].parameters()):
             tp.data.copy_(tau * p.data + (1 - tau) * tp.data)
@@ -182,6 +216,7 @@ class OursAgent(nn.Module):
                 f"num_tasks={self.num_tasks}\n"
                 f"obs_dim={self.obs_dim}\n"
                 f"act_dim={self.act_dim}\n"
+                f"crossq={int(getattr(self, 'crossq', False))}\n"
             )
 
     @staticmethod
@@ -195,6 +230,7 @@ class OursAgent(nn.Module):
         model.qf2_target = torch.load(f"{dirname}/qf2_target.pt", map_location=map_location)
         model.obs_dim = model.actor.obs_dim
         model.act_dim = model.actor.act_dim
+        model.crossq = len(model.qf1_target) == 0  # no targets => CrossQ
         try:
             with open(f"{dirname}/meta.txt") as f:
                 for line in f:
@@ -202,6 +238,8 @@ class OursAgent(nn.Module):
                         model.obs_dim = int(line.strip().split("=")[1])
                     elif line.startswith("act_dim="):
                         model.act_dim = int(line.strip().split("=")[1])
+                    elif line.startswith("crossq="):
+                        model.crossq = bool(int(line.strip().split("=")[1]))
         except Exception:
             pass
         return model

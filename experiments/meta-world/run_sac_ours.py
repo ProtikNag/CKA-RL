@@ -73,6 +73,7 @@ only. Do not run on the login node.
 """
 import os
 import json
+import math
 import time
 import random
 import argparse
@@ -89,6 +90,7 @@ from stable_baselines3.common.buffers import ReplayBuffer
 
 from models.ours import OursAgent
 from tasks import get_task, tasks as CW20_TASKS
+from contract_logging import ContractLogger
 
 
 # ---------------- Reference SAC hyperparameters (run_sac.py) -----------------
@@ -103,6 +105,10 @@ POLICY_FREQUENCY = 2
 TARGET_NETWORK_FREQUENCY = 1
 BUFFER_SIZE = int(1e6)
 EP_LEN = 500  # Meta-World episode length
+# Fixed entropy scale for the windowed-bootstrap value's -alpha*log_pi term.
+# Used on BOTH sides of the shortfall (Vk_L and Vk_G) so the entropy bias is
+# identical and cancels; matches the non-autotune SAC default (0.2).
+BOOT_ALPHA = 0.2
 
 LOG_STD_MAX = 2
 LOG_STD_MIN = -20
@@ -116,10 +122,47 @@ def make_env(task_id):
     return thunk
 
 
-def build_env(task_id, seed):
-    envs = gym.vector.SyncVectorEnv([make_env(task_id)])
+def build_env(task_id, seed, n_envs=1):
+    """Build a vectorized env with ``n_envs`` copies of ``task_id``.
+
+    n_envs>1 uses AsyncVectorEnv (subprocess parallelism); it is spawn-fragile
+    on some clusters, so construction is wrapped in try/except and falls back to
+    a (serial) SyncVectorEnv of the same width on failure.
+    """
+    n_envs = max(1, int(n_envs))
+    if n_envs > 1:
+        try:
+            envs = gym.vector.AsyncVectorEnv([make_env(task_id) for _ in range(n_envs)])
+        except Exception as e:
+            logger.warning(f"AsyncVectorEnv(n_envs={n_envs}) failed ({e!r}); "
+                           f"falling back to SyncVectorEnv")
+            envs = gym.vector.SyncVectorEnv([make_env(task_id) for _ in range(n_envs)])
+    else:
+        envs = gym.vector.SyncVectorEnv([make_env(task_id)])
     envs.single_observation_space.dtype = np.float32
     return envs
+
+
+# ---- persistent eval-env cache (deterministic_eval / windowed_shortfall reuse) ---
+# Building + closing a (possibly Async) vector env on every eval call is slow;
+# cache one per (task_id, n_envs) and reuse. close_eval_envs() tears them down.
+_EVAL_ENV_CACHE = {}
+
+
+def get_eval_env(task_id, seed, n_envs=1):
+    key = (int(task_id), int(n_envs))
+    if key not in _EVAL_ENV_CACHE:
+        _EVAL_ENV_CACHE[key] = build_env(task_id, seed, n_envs=n_envs)
+    return _EVAL_ENV_CACHE[key]
+
+
+def close_eval_envs():
+    for e in _EVAL_ENV_CACHE.values():
+        try:
+            e.close()
+        except Exception:
+            pass
+    _EVAL_ENV_CACHE.clear()
 
 
 def _action_bounds(task_id, seed):
@@ -235,6 +278,33 @@ def parse_args():
     p.add_argument("--cuda", type=lambda v: str(v).lower() in ("1", "true", "yes", "y"),
                    default=True)
     p.add_argument("--debug", action="store_true")
+    # ---- speedup stack (each behind its own flag; defaults keep new path on) --
+    _bool = lambda v: str(v).lower() in ("1", "true", "yes", "y")
+    p.add_argument("--n-envs", type=int, default=8,
+                   help="# parallel envs per task (Async if >1, else Sync). "
+                        "total env-step budgets are unchanged; --n-envs 1 == "
+                        "original single-env behavior.")
+    p.add_argument("--value-mode", type=str, default="bootstrap",
+                   choices=["mc", "bootstrap"],
+                   help="TRAINING constraint value: 'mc' = full deterministic "
+                        "MC rollout (original); 'bootstrap' = windowed "
+                        "value-gap with a gamma^H critic bootstrap.")
+    p.add_argument("--window-H", type=int, default=200,
+                   help="window length H for --value-mode bootstrap")
+    p.add_argument("--n-boot-samples", type=int, default=4,
+                   help="# sampled actions averaged for each soft state value "
+                        "V(s) endpoint in --value-mode bootstrap (variance "
+                        "reduction on the -alpha*log_pi soft-V estimate)")
+    p.add_argument("--crossq", type=_bool, default=True,
+                   help="CrossQ critic (BatchNorm, no target net, joint "
+                        "forward). Critic-only; actor unchanged. False -> "
+                        "standard SAC target-net critic.")
+    p.add_argument("--contract-eval-every", type=int, default=25000,
+                   help="within-phase greedy-eval cadence (env steps) for the "
+                        "ContractLogger FWT curve during single-task phases")
+    p.add_argument("--torch-threads", type=int, default=0,
+                   help="if >0, torch.set_num_threads(this) to avoid "
+                        "oversubscription with N async env processes")
     return p.parse_args()
 
 
@@ -352,50 +422,190 @@ def sac_actor_loss(agent, actor, rb_data, task_idx, alpha, device):
     return actor_loss, log_pi
 
 
+# ---------------- CrossQ update helpers (critic-only; no target net) ----------
+def crossq_critic_loss(agent, actor, rb_data, task_idx, alpha, device):
+    """CrossQ (Bhatt et al. ICLR 2024) twin-Q critic loss -- NO target net.
+
+    Current (obs, act) and next (next_obs, a') are forwarded JOINTLY through each
+    online critic so BatchNorm normalizes both with the SAME batch statistics
+    (the crux of CrossQ). The policy that produces a' carries no gradient; the
+    Q(next) branch is forwarded WITH grad through the critic then the whole
+    target y is detached, so only the current-Q branch trains the critic.
+    """
+    qf1, qf2 = agent.qf1[task_idx], agent.qf2[task_idx]
+    with torch.no_grad():
+        next_actions, next_logpi, _ = actor.get_action(rb_data.next_observations, task_idx)
+    cat_obs = torch.cat([rb_data.observations, rb_data.next_observations], dim=0)
+    cat_act = torch.cat([rb_data.actions, next_actions], dim=0)
+    n = rb_data.observations.shape[0]
+    qf1.train(); qf2.train()
+    q1_all = qf1(cat_obs, cat_act)
+    q2_all = qf2(cat_obs, cat_act)
+    q1_sa, q1_next = q1_all[:n], q1_all[n:]
+    q2_sa, q2_next = q2_all[:n], q2_all[n:]
+    with torch.no_grad():
+        min_q_next = torch.min(q1_next, q2_next) - alpha * next_logpi
+        y = (rb_data.rewards.flatten()
+             + (1 - rb_data.dones.flatten()) * GAMMA * min_q_next.view(-1)).detach()
+    loss = F.mse_loss(q1_sa.view(-1), y) + F.mse_loss(q2_sa.view(-1), y)
+    return loss
+
+
+def crossq_actor_loss(agent, actor, rb_data, task_idx, alpha, device):
+    """CrossQ actor loss: identical to sac_actor_loss but the task's critics are
+    put in .eval() around the Q evaluation so BatchNorm uses running stats and
+    the actor step does NOT pollute the critic's batch statistics."""
+    pi, log_pi, _ = actor.get_action(rb_data.observations, task_idx)
+    qf1, qf2 = agent.qf1[task_idx], agent.qf2[task_idx]
+    was1, was2 = qf1.training, qf2.training
+    qf1.eval(); qf2.eval()
+    qf1_pi = qf1(rb_data.observations, pi)
+    qf2_pi = qf2(rb_data.observations, pi)
+    qf1.train(was1); qf2.train(was2)
+    min_q_pi = torch.min(qf1_pi, qf2_pi)
+    actor_loss = ((alpha * log_pi) - min_q_pi).mean()
+    return actor_loss, log_pi
+
+
 # ---------------- deterministic MC value + success ---------------------------
 @torch.no_grad()
-def deterministic_eval(actor, task_id, task_idx, seed, n_episodes, device, gamma=GAMMA):
-    """Run n_episodes DETERMINISTIC (mean) episodes on task `task_id` with head
+def deterministic_eval(actor, task_id, task_idx, seed, n_episodes, device,
+                      gamma=GAMMA, n_envs=1):
+    """Run >= n_episodes DETERMINISTIC (mean) episodes on task `task_id` with head
     `task_idx`. Returns (mc_discounted_return, success_rate).
 
     mc_discounted_return is the Monte-Carlo discounted return V^pi used for the
     shortfall / constraint (gamma^t reward accumulation, reset per episode),
     analogous to the Atari mc_stochastic_value but with the DETERMINISTIC policy
     (the spec requires the deterministic(mean) policy for the constraint value).
-    success_rate is the mean of native info["success"] at episode end."""
-    envs = build_env(task_id, seed + 777)
+    success_rate is the mean of native info["success"] at episode end. With
+    n_envs>1, episodes are collected in parallel (each env's per-episode
+    discount resets independently)."""
+    envs = get_eval_env(task_id, seed + 777, n_envs=n_envs)
+    N = envs.num_envs
     obs, _ = envs.reset(seed=seed + 777)
     disc_returns = []
     successes = []
-    disc = 0.0
-    gpow = 1.0
+    disc = np.zeros(N, dtype=np.float64)
+    gpow = np.ones(N, dtype=np.float64)
     while len(disc_returns) < n_episodes:
         obs_t = torch.Tensor(obs).to(device)
         action = actor.deterministic_action(obs_t, task_idx)
         obs, reward, term, trunc, infos = envs.step(action.cpu().numpy())
-        disc += gpow * float(np.asarray(reward).reshape(-1)[0])
+        reward = np.asarray(reward, dtype=np.float64).reshape(-1)
+        disc += gpow * reward
         gpow *= gamma
-        done = bool(np.asarray(term).reshape(-1)[0] or np.asarray(trunc).reshape(-1)[0])
-        if done:
-            # SyncVectorEnv: success in final_info on episode end
-            succ = 0.0
-            if "final_info" in infos:
-                for info in infos["final_info"]:
-                    if info is not None and "success" in info:
-                        succ = float(info["success"])
-                        break
-            disc_returns.append(disc)
-            successes.append(succ)
-            disc = 0.0
-            gpow = 1.0
-    envs.close()
+        done = np.logical_or(np.asarray(term).reshape(-1),
+                             np.asarray(trunc).reshape(-1))
+        if "final_info" in infos:
+            final_info = infos["final_info"]
+            for idx in range(N):
+                if not done[idx]:
+                    continue
+                succ = 0.0
+                info = final_info[idx] if final_info is not None else None
+                if info is not None and "success" in info:
+                    succ = float(info["success"])
+                disc_returns.append(disc[idx])
+                successes.append(succ)
+                disc[idx] = 0.0
+                gpow[idx] = 1.0
     return float(np.mean(disc_returns[:n_episodes])), float(np.mean(successes[:n_episodes]))
+
+
+@torch.no_grad()
+def _soft_value(owner, actor, task_idx, obs_np, alpha, device, n_boot_samples=4):
+    """Per-state SAC soft state value V(s) using ``owner``'s task-idx critics.
+
+    V(s) = mean over n_boot_samples SAMPLED actions of
+        [ min(Q1,Q2)(s,a) - alpha*log pi(a|s) ]
+    (variance-reduced soft-V; sampled actions rather than the deterministic mean,
+    whose log-density is pathological near tanh saturation). ``owner``'s critics
+    are put in .eval() around the Q evaluations (BN running stats; no-op for
+    plain SAC critics) and their prior training mode is restored. Returns a
+    per-state numpy vector (one entry per row of ``obs_np``)."""
+    s = torch.Tensor(obs_np).to(device)
+    qf1, qf2 = owner.qf1[task_idx], owner.qf2[task_idx]
+    was1, was2 = qf1.training, qf2.training
+    qf1.eval(); qf2.eval()
+    v_samples = []
+    for _ in range(max(1, int(n_boot_samples))):
+        a, logp_a, _ = actor.get_action(s, task_idx)
+        q1 = qf1(s, a).view(-1)
+        q2 = qf2(s, a).view(-1)
+        v_samples.append(torch.min(q1, q2) - alpha * logp_a.view(-1))
+    qf1.train(was1); qf2.train(was2)
+    return torch.stack(v_samples, dim=0).mean(dim=0).detach().cpu().numpy()
+
+
+@torch.no_grad()
+def windowed_shortfall(local_owner, local_actor, roll_actor, task_id, task_idx,
+                       seed, n_starts, H, device, alpha, gamma=GAMMA, n_envs=1,
+                       n_boot_samples=4):
+    """Single-critic windowed shortfall endpoints (Vk_L, Vk_G).
+
+    BOTH state values V(S_0) and V(S_H) are computed with the SAME frozen LOCAL
+    specialist's critic + local actor (``local_owner`` / ``local_actor``), so the
+    local critic's systematic bias largely cancels in the shortfall
+    Vk_L - Vk_G. Only the H-step reward term is rolled with the CURRENT GLOBAL
+    policy (``roll_actor``):
+
+        Vk_L = V_L(S_0)                              (local-critic baseline value)
+        Vk_G = sum_{t<H} gamma^t r_t  +  gamma^H * V_L(S_H)
+               (global policy's H-step rollout reward + local-critic tail)
+
+    The global critic is NO LONGER used for the constraint value (it is still
+    used for the SAC/CrossQ actor-improvement updates elsewhere).
+
+    Mid-window termination: once an env terminates, its reward accumulation and
+    its bootstrap term are masked to 0 (a per-env done mask + gpow freeze).
+
+    Returns (Vk_L, Vk_G) each averaged over the first min(n_starts, N) envs."""
+    envs = get_eval_env(task_id, seed + 777, n_envs=n_envs)
+    N = envs.num_envs
+    obs, _ = envs.reset(seed=seed + 777)
+    S0 = obs
+    # Vk_L baseline: local-critic soft value at the start states (per-env).
+    v0 = _soft_value(local_owner, local_actor, task_idx, S0, alpha, device,
+                     n_boot_samples)
+    ret = np.zeros(N, dtype=np.float64)
+    gpow = np.ones(N, dtype=np.float64)
+    done_mask = np.zeros(N, dtype=bool)  # True once an env has terminated
+    last_obs = obs
+    for t in range(H):
+        obs_t = torch.Tensor(obs).to(device)
+        action = roll_actor.deterministic_action(obs_t, task_idx)  # GLOBAL policy
+        obs, reward, term, trunc, infos = envs.step(action.cpu().numpy())
+        reward = np.asarray(reward, dtype=np.float64).reshape(-1)
+        active = ~done_mask
+        ret[active] += gpow[active] * reward[active]
+        gpow[active] *= gamma
+        # freeze envs that terminated THIS step (their S_H bootstrap is masked).
+        term = np.asarray(term).reshape(-1)
+        trunc = np.asarray(trunc).reshape(-1)
+        # a genuine termination ends the episode's value; a time-limit trunc
+        # does NOT (autoreset happens, but we treat it as continuation and just
+        # stop trusting that env's window -> mask it too, conservatively).
+        newly = np.logical_and(active, np.logical_or(term, trunc))
+        done_mask = np.logical_or(done_mask, newly)
+        last_obs = obs  # S_H candidate (autoreset-safe: masked envs ignored)
+        if done_mask.all():
+            break
+    # bootstrap tail V_L(S_H) with the SAME frozen LOCAL critic (not the global).
+    vH = _soft_value(local_owner, local_actor, task_idx, last_obs, alpha, device,
+                     n_boot_samples)
+    boot = (gamma ** H) * vH
+    boot[done_mask] = 0.0  # terminated envs contribute no bootstrap
+    est = ret + boot       # Vk_G, per-env
+    m = min(n_starts, N)
+    return float(np.mean(v0[:m])), float(np.mean(est[:m]))
 
 
 # ---------------- standard single-task SAC (task0 + local phase) -------------
 def train_sac_single_task(agent, task_id, task_idx, seed, total_steps, device,
                           writer, reporter=None, phase="sac", task_k=None,
-                          save_name=None, autotune=True):
+                          save_name=None, autotune=True, clog=None,
+                          clog_task_idx=None, clog_phase=None):
     """Standard unconstrained SAC on one task using head `task_idx`.
 
     Updates the shared encoder, actor head task_idx, and task-idx critics. Logs
@@ -403,10 +613,15 @@ def train_sac_single_task(agent, task_id, task_idx, seed, total_steps, device,
     to `writer` (the plasticity-comparable Table-1 curve). Returns env steps
     consumed. Mirrors run_sac.py's training loop exactly, restricted to head
     task_idx's parameters."""
-    envs = build_env(task_id, seed)
+    n_envs = getattr(reporter.args, "n_envs", 1) if reporter else 1
+    crossq = getattr(reporter.args, "crossq", False) if reporter else False
+    envs = build_env(task_id, seed, n_envs=n_envs)
+    N = envs.num_envs
     action_low = envs.single_action_space.low
     action_high = envs.single_action_space.high
     actor = ActorHelper(agent, action_low, action_high, device)
+    critic_loss_fn = crossq_critic_loss if crossq else sac_critic_loss
+    actor_loss_fn = crossq_actor_loss if crossq else sac_actor_loss
 
     # optimizers: actor side = shared encoder + this head's mean/logstd; q side
     # = this task's twin critics. (Only head task_idx trains in this phase.)
@@ -416,7 +631,9 @@ def train_sac_single_task(agent, task_id, task_idx, seed, total_steps, device,
     q_params = (list(agent.qf1[task_idx].parameters())
                 + list(agent.qf2[task_idx].parameters()))
     actor_optimizer = optim.Adam(actor_params, lr=POLICY_LR)
-    q_optimizer = optim.Adam(q_params, lr=Q_LR)
+    # CrossQ uses Adam betas=(0.5, 0.999) for the critic (paper recommendation).
+    q_betas = (0.5, 0.999) if crossq else (0.9, 0.999)
+    q_optimizer = optim.Adam(q_params, lr=Q_LR, betas=q_betas)
 
     if autotune:
         target_entropy = -float(np.prod(envs.single_action_space.shape))
@@ -426,21 +643,28 @@ def train_sac_single_task(agent, task_id, task_idx, seed, total_steps, device,
     else:
         alpha = 0.2
 
+    # SB3 divides buffer_size by n_envs internally, so pass the FULL BUFFER_SIZE
+    # (not BUFFER_SIZE//N) to keep total capacity ~constant across n_envs.
     rb = ReplayBuffer(BUFFER_SIZE, envs.single_observation_space,
-                      envs.single_action_space, device,
+                      envs.single_action_space, device, n_envs=N,
                       handle_timeout_termination=False)
 
     log_every = getattr(reporter.args, "log_every", 5) if reporter else 10**9
     ckpt_every = getattr(reporter.args, "ckpt_every", 0) if reporter else 0
+    contract_eval_every = getattr(reporter.args, "contract_eval_every", 0) if reporter else 0
+    ce_episodes = getattr(reporter.args, "stop_eval_episodes", 3) if reporter else 3
     ep_count = 0
     t0 = time.time()
     last_actor = last_q = float("nan")
+    grad_steps = 0  # global gradient-step counter (UTD cadence, n_envs-invariant)
 
     obs, _ = envs.reset(seed=seed)
-    for global_step in range(total_steps):
-        if global_step < RANDOM_ACTIONS_END:
-            actions = np.array([envs.single_action_space.sample()
-                                for _ in range(envs.num_envs)])
+    # total_steps is an ENV-STEP budget; each iteration consumes N env steps, so
+    # loop total_steps // N times. env-step thresholds compare against step * N.
+    for step in range(total_steps // N):
+        env_step = step * N  # # env steps consumed BEFORE this iteration
+        if env_step < RANDOM_ACTIONS_END:
+            actions = np.array([envs.single_action_space.sample() for _ in range(N)])
         else:
             a, _, _ = actor.get_action(torch.Tensor(obs).to(device), task_idx)
             actions = a.detach().cpu().numpy()
@@ -448,14 +672,14 @@ def train_sac_single_task(agent, task_id, task_idx, seed, total_steps, device,
         next_obs, rewards, terminations, truncations, infos = envs.step(actions)
 
         if "final_info" in infos:
-            for info in infos["final_info"]:
+            for idx in range(N):
+                info = infos["final_info"][idx]
                 if info is None:
                     continue
-                writer.add_scalar("charts/episodic_return", info["episode"]["r"], global_step)
-                writer.add_scalar("charts/episodic_length", info["episode"]["l"], global_step)
-                writer.add_scalar("charts/success", info["success"], global_step)
+                writer.add_scalar("charts/episodic_return", info["episode"]["r"], env_step)
+                writer.add_scalar("charts/episodic_length", info["episode"]["l"], env_step)
+                writer.add_scalar("charts/success", info["success"], env_step)
                 ep_count += 1
-                break
 
         real_next_obs = next_obs.copy()
         for idx, trunc in enumerate(truncations):
@@ -464,59 +688,78 @@ def train_sac_single_task(agent, task_id, task_idx, seed, total_steps, device,
         rb.add(obs, real_next_obs, actions, rewards, terminations, infos)
         obs = next_obs
 
-        if global_step > LEARNING_STARTS:
-            data = rb.sample(BATCH_SIZE)
-            q_loss = sac_critic_loss(agent, actor, data, task_idx, alpha, device)
-            q_optimizer.zero_grad()
-            q_loss.backward()
-            q_optimizer.step()
-            last_q = float(q_loss.item())
+        if env_step > LEARNING_STARTS:
+            # UTD-preserving: do N gradient steps per iteration (one per env step
+            # collected this iter) so the TOTAL update count == the n_envs=1 run.
+            # n_envs then changes only env-stepping wall-clock, NOT the learning
+            # dynamics. A GLOBAL grad_steps counter keeps the POLICY_FREQUENCY and
+            # target-sync cadence identical across n_envs (a per-iter g%FREQ gate
+            # would fire every iteration and double the actor rate at n_envs=1).
+            for _ in range(N):
+                data = rb.sample(BATCH_SIZE)
+                q_loss = critic_loss_fn(agent, actor, data, task_idx, alpha, device)
+                q_optimizer.zero_grad()
+                q_loss.backward()
+                q_optimizer.step()
+                last_q = float(q_loss.item())
 
-            if global_step % POLICY_FREQUENCY == 0:
-                for _ in range(POLICY_FREQUENCY):
-                    actor_loss, _ = sac_actor_loss(agent, actor, data, task_idx, alpha, device)
-                    actor_optimizer.zero_grad()
-                    actor_loss.backward()
-                    actor_optimizer.step()
-                    last_actor = float(actor_loss.item())
-                    if autotune:
-                        with torch.no_grad():
-                            _, log_pi, _ = actor.get_action(data.observations, task_idx)
-                        alpha_loss = (-log_alpha.exp() * (log_pi + target_entropy)).mean()
-                        a_optimizer.zero_grad()
-                        alpha_loss.backward()
-                        a_optimizer.step()
-                        alpha = log_alpha.exp().item()
+                if grad_steps % POLICY_FREQUENCY == 0:
+                    for _ in range(POLICY_FREQUENCY):
+                        actor_loss, _ = actor_loss_fn(agent, actor, data, task_idx, alpha, device)
+                        actor_optimizer.zero_grad()
+                        actor_loss.backward()
+                        actor_optimizer.step()
+                        last_actor = float(actor_loss.item())
+                        if autotune:
+                            with torch.no_grad():
+                                _, log_pi, _ = actor.get_action(data.observations, task_idx)
+                            alpha_loss = (-log_alpha.exp() * (log_pi + target_entropy)).mean()
+                            a_optimizer.zero_grad()
+                            alpha_loss.backward()
+                            a_optimizer.step()
+                            alpha = log_alpha.exp().item()
 
-            if global_step % TARGET_NETWORK_FREQUENCY == 0:
-                agent.sync_targets(task_idx, TAU)
+                # CrossQ has no target net -> skip sync (guarded no-op anyway).
+                if not crossq and grad_steps % TARGET_NETWORK_FREQUENCY == 0:
+                    agent.sync_targets(task_idx, TAU)
+                grad_steps += 1
 
         # ---- stream progress / status / rolling checkpoint ----
-        if reporter is not None and global_step > 0 and global_step % (log_every * 1000) == 0:
-            sps = int(global_step / max(1e-9, time.time() - t0))
-            frac_done = global_step / max(1, total_steps)
+        if reporter is not None and env_step > 0 and env_step % (log_every * 1000) < N:
+            sps = int(env_step / max(1e-9, time.time() - t0))
+            frac_done = env_step / max(1, total_steps)
             reporter.progress(task=task_k, task_id=task_id, phase=phase,
-                              global_step=global_step, total_steps=total_steps,
+                              global_step=env_step, total_steps=total_steps,
                               sps=sps, episodes=ep_count,
                               actor_loss=round(last_actor, 5), q_loss=round(last_q, 5),
                               alpha=round(float(alpha), 5))
             reporter.status(task=task_k, task_id=task_id, phase=phase,
-                            global_step=global_step, total_steps=total_steps,
+                            global_step=env_step, total_steps=total_steps,
                             percent=round(100 * frac_done, 1), sps=sps,
                             phase_elapsed_sec=round(time.time() - t0, 1),
                             phase_eta_sec=round((time.time() - t0) * (1 - frac_done) / max(1e-9, frac_done), 1))
         if reporter is not None and ckpt_every and save_name and \
-                global_step > 0 and global_step % (ckpt_every * 1000) == 0:
+                env_step > 0 and env_step % (ckpt_every * 1000) < N:
             reporter.checkpoint(agent, f"{save_name}_latest")
 
+        # ---- within-phase greedy eval -> ContractLogger (FWT curve) ----
+        if (clog is not None and contract_eval_every > 0 and env_step > 0
+                and env_step % contract_eval_every < N):
+            succ = deterministic_eval(actor, task_id, task_idx, seed,
+                                      ce_episodes, device, n_envs=n_envs)[1]
+            ti = clog_task_idx if clog_task_idx is not None else (task_k or 0)
+            clog.eval(task_idx=ti, phase=(clog_phase or phase), it=int(env_step),
+                      evaluated_on=ti, evaluated_on_task=CW20_TASKS[task_id],
+                      raw=succ, episodes=ce_episodes, greedy=True, seen=True)
+
     envs.close()
-    return total_steps
+    return (total_steps // N) * N
 
 
 # ---------------- global consolidation phase ---------------------------------
 def train_global_phase(agent, local_agent, task_ids, seen_idx, k, seed, args,
                        device, local_value_refs, local_success_refs,
-                       cons_writers, reporter=None, autotune=True):
+                       cons_writers, reporter=None, autotune=True, clog=None):
     """Min-max consolidation. `seen_idx` = task indices 0..k; current = k.
 
     Each iteration: for every ACTIVE task, collect ONE fresh on-policy episode
@@ -528,6 +771,12 @@ def train_global_phase(agent, local_agent, task_ids, seen_idx, k, seed, args,
     early stop over all seen tasks.
     """
     needy_mode = (getattr(args, "consolidate_mode", "all") == "needy")
+    n_envs = getattr(args, "n_envs", 1)
+    crossq = getattr(args, "crossq", False)
+    value_mode = getattr(args, "value_mode", "mc")
+    window_H = getattr(args, "window_H", 200)
+    critic_loss_fn = crossq_critic_loss if crossq else sac_critic_loss
+    actor_loss_fn = crossq_actor_loss if crossq else sac_actor_loss
     past = [i for i in seen_idx if i < k]
 
     # per-active-task env + replay buffer + obs state, managed lazily so only
@@ -542,15 +791,21 @@ def train_global_phase(agent, local_agent, task_ids, seen_idx, k, seed, args,
     act_space = probe.single_action_space
     probe.close()
     actor = ActorHelper(agent, action_low, action_high, device)
+    # Frozen LOCAL specialist actor -- drives BOTH endpoints' soft-V via the
+    # frozen local critic (bootstrap mode). Built once; None when no local_agent
+    # (task 0 has no local phase).
+    local_actor_ref = (ActorHelper(local_agent, action_low, action_high, device)
+                       if local_agent is not None else None)
 
     def open_task(i):
         if i in envs_by_idx:
             return
-        e = build_env(task_ids[i], seed + 1000 + i)
+        e = build_env(task_ids[i], seed + 1000 + i, n_envs=n_envs)
         o, _ = e.reset(seed=seed + 1000 + i)
         envs_by_idx[i] = e
         obs_by_idx[i] = o
         rb_by_idx[i] = ReplayBuffer(BUFFER_SIZE, obs_space, act_space, device,
+                                    n_envs=e.num_envs,
                                     handle_timeout_termination=False)
 
     def close_task(i):
@@ -572,7 +827,7 @@ def train_global_phase(agent, local_agent, task_ids, seen_idx, k, seed, args,
         out = {}
         for i in seen_idx:
             v, s = deterministic_eval(actor, task_ids[i], i, seed,
-                                      args.stop_eval_episodes, device)
+                                      args.stop_eval_episodes, device, n_envs=n_envs)
             out[i] = (v, s)
         return out
 
@@ -589,40 +844,49 @@ def train_global_phase(agent, local_agent, task_ids, seen_idx, k, seed, args,
                 res.append(i)
         return res
 
-    # ---- collect one on-policy episode into task i's replay buffer ----
+    # ---- collect one episode worth of env steps into task i's replay buffer --
+    # With N envs, collect N parallel partial episodes for ceil(EP_LEN/N) loop
+    # steps and count EXACTLY EP_LEN env steps (last step clamped). Returns the
+    # ENV-STEP count added (== EP_LEN).
     def collect_episode(i):
         e = envs_by_idx[i]
+        N = e.num_envs
         obs = obs_by_idx[i]
-        steps = 0
-        while True:
+        loop_steps = max(1, math.ceil(EP_LEN / N))
+        env_steps = 0
+        for _ in range(loop_steps):
+            if env_steps >= EP_LEN:
+                break
             obs_t = torch.Tensor(obs).to(device)
             with torch.no_grad():
                 a, _, _ = actor.get_action(obs_t, i)
             actions = a.detach().cpu().numpy()
             next_obs, rewards, terminations, truncations, infos = e.step(actions)
-            ep_done = False
             if "final_info" in infos:
-                for info in infos["final_info"]:
+                for idx in range(N):
+                    info = infos["final_info"][idx]
                     if info is None:
                         continue
                     # log to the SEPARATE consolidation writer for task i
                     w = cons_writers[i]
                     w.add_scalar("charts/episodic_return", info["episode"]["r"], iteration_global_step[0])
                     w.add_scalar("charts/success", info["success"], iteration_global_step[0])
-                    ep_done = True
-                    break
             real_next_obs = next_obs.copy()
             for idx, trunc in enumerate(truncations):
                 if trunc:
                     real_next_obs[idx] = infos["final_observation"][idx]
             rb_by_idx[i].add(obs, real_next_obs, actions, rewards, terminations, infos)
             obs = next_obs
-            steps += 1
-            iteration_global_step[0] += 1
-            if ep_done or steps >= EP_LEN:
-                break
+            # count env steps EXACTLY: the last partial loop step over-steps the
+            # vector env by (N * loop_steps - EP_LEN); clamp the ACCOUNTING to
+            # EP_LEN so the returned/global env-step total is exact (n_envs=1 is
+            # unchanged: EP_LEN divides evenly). Extra transitions in the buffer
+            # are harmless.
+            add = min(N, EP_LEN - env_steps)
+            env_steps += add
+            iteration_global_step[0] += add
         obs_by_idx[i] = obs
-        return steps
+        return env_steps
 
     # ---- initial active set ----
     if needy_mode:
@@ -645,7 +909,9 @@ def train_global_phase(agent, local_agent, task_ids, seen_idx, k, seed, args,
         for i in active:
             q_params += list(agent.qf1[i].parameters())
             q_params += list(agent.qf2[i].parameters())
-        return optim.Adam(actor_params, lr=POLICY_LR), optim.Adam(q_params, lr=Q_LR)
+        q_betas = (0.5, 0.999) if crossq else (0.9, 0.999)
+        return (optim.Adam(actor_params, lr=POLICY_LR),
+                optim.Adam(q_params, lr=Q_LR, betas=q_betas))
 
     actor_optimizer, q_optimizer = build_optimizers(active)
 
@@ -663,24 +929,41 @@ def train_global_phase(agent, local_agent, task_ids, seen_idx, k, seed, args,
     total_consolidation_steps = 0
     iteration_global_step = [0]  # mutable counter shared with collect_episode
 
-    # V_k^L is fixed (frozen local specialist); computed once.
-    Vk_L = local_value_refs[k]
-    # Dual tolerance. The shortfall (V_k^L - V_k^G) is a Meta-World dense-reward
-    # DISCOUNTED return (O(100s-1000s)), so a fixed Atari-scale eps (0.04) is
-    # meaningless here. Use a tolerance RELATIVE to the local reference value:
-    #   eps_eff = (tol_frac * V_k^L)^2   (squared, matching shortfall_k^2).
+    # Both shortfall endpoints use the SAME frozen local specialist's critic:
+    #   Vk_L = V_L(S_0)                              (local-critic baseline value)
+    #   Vk_G = sum_{t<H} gamma^t r_t + gamma^H V_L(S_H)  (global rollout + local tail)
+    # so the local critic's systematic bias largely cancels in Vk_L - Vk_G. In
+    # 'mc' mode Vk_L falls back to the local MC return (local_value_refs[k]) and
+    # Vk_G is the global's deterministic-MC return. Retention still uses
+    # local_value_refs (MC) -- reported retention is kept separate.
+    def compute_shortfall():
+        if value_mode == "bootstrap" and local_actor_ref is not None:
+            # BOOT_ALPHA (not the live alpha) so both endpoints' entropy scale
+            # is identical -> the -alpha*log_pi bias cancels in the shortfall.
+            return windowed_shortfall(local_agent, local_actor_ref, actor,
+                                      task_ids[k], k, seed,
+                                      args.constraint_episodes, window_H, device,
+                                      BOOT_ALPHA, n_envs=n_envs,
+                                      n_boot_samples=args.n_boot_samples)
+        vg, _ = deterministic_eval(actor, task_ids[k], k, seed,
+                                   args.constraint_episodes, device, n_envs=n_envs)
+        return local_value_refs[k], vg
+
+    # initial (Vk_L, Vk_G) + shortfall so coeff_k is defined before first refresh.
+    Vk_L, Vk_G = compute_shortfall()
+    # Dual tolerance, RELATIVE to the (initial) local reference value:
+    #   eps_eff = (tol_frac * Vk_L)^2   (squared, matching shortfall_k^2).
+    # Computed ONCE from the initial Vk_L and held FIXED for the phase so the
+    # constraint bar doesn't drift as Vk_L is re-estimated each refresh.
     # --eps-abs (>= 0) overrides with a fixed absolute value if the user opts in.
     if getattr(args, "eps_abs", -1.0) >= 0.0:
         eps_eff = float(args.eps_abs)
     else:
         eps_eff = float((args.tol_frac * Vk_L) ** 2)
-    logger.info(f"[global k={k}] Vk_L={Vk_L:.3f} tol_frac={args.tol_frac} "
-                f"eps_eff={eps_eff:.5f} "
-                f"(eps_abs override={'yes' if getattr(args, 'eps_abs', -1.0) >= 0.0 else 'no'})")
-    # initial V_k^G + shortfall so coeff_k is defined before first refresh.
-    Vk_G, _ = deterministic_eval(actor, task_ids[k], k, seed,
-                                 args.constraint_episodes, device)
     shortfall_k = max(0.0, Vk_L - Vk_G)
+    logger.info(f"[global k={k}] Vk_L={Vk_L:.3f} tol_frac={args.tol_frac} "
+                f"eps_eff={eps_eff:.5f} value_mode={value_mode} "
+                f"(eps_abs override={'yes' if getattr(args, 'eps_abs', -1.0) >= 0.0 else 'no'})")
     logger.info(f"[global k={k}] Vk_L={Vk_L:.3f} initial Vk_G={Vk_G:.3f} "
                 f"shortfall={shortfall_k:.3f}")
 
@@ -697,13 +980,17 @@ def train_global_phase(agent, local_agent, task_ids, seen_idx, k, seed, args,
 
         # ---- two-timescale refresh: Vk_G / shortfall + mu every constraint_every
         if iteration % args.constraint_every == 0:
-            Vk_G, _ = deterministic_eval(actor, task_ids[k], k, seed,
-                                         args.constraint_episodes, device)
+            Vk_L, Vk_G = compute_shortfall()
             shortfall_k = max(0.0, Vk_L - Vk_G)
             mu = float(np.clip(mu + args.dual_lr * (shortfall_k ** 2 - eps_eff),
                                0.0, args.mu_max))
             logger.info(f"[global k={k}] it={iteration} shortfall={shortfall_k:.3f} "
                         f"Vk_G={Vk_G:.3f} mu={mu:.4f}")
+            if clog is not None:
+                clog.dual(task_idx=k, it=iteration, mu=mu, lam=None,
+                          shortfall_current=shortfall_k, shortfall_past=None,
+                          coeff_current=(mu * 2.0 * shortfall_k),
+                          grad_share_past=None)
 
         # ---- actor coefficients over the ACTIVE set (held shortfall_k + mu) ----
         coeffs = {}
@@ -726,10 +1013,10 @@ def train_global_phase(agent, local_agent, task_ids, seen_idx, k, seed, args,
         for upd in range(n_updates):
             data_by_idx = {i: rb_by_idx[i].sample(BATCH_SIZE) for i in ready}
 
-            # --- critics: STANDARD per-task SAC loss, summed (not normalized) ---
+            # --- critics: STANDARD per-task SAC (or CrossQ) loss, summed ---
             total_q = 0.0
             for i in ready:
-                total_q = total_q + sac_critic_loss(agent, actor, data_by_idx[i], i, alpha, device)
+                total_q = total_q + critic_loss_fn(agent, actor, data_by_idx[i], i, alpha, device)
             q_optimizer.zero_grad()
             total_q.backward()
             q_optimizer.step()
@@ -747,7 +1034,7 @@ def train_global_phase(agent, local_agent, task_ids, seen_idx, k, seed, args,
                     total_actor = 0.0
                     logpi_cat = []
                     for i in ready:
-                        a_loss, log_pi = sac_actor_loss(agent, actor, data_by_idx[i], i, alpha, device)
+                        a_loss, log_pi = actor_loss_fn(agent, actor, data_by_idx[i], i, alpha, device)
                         w = norm_coeffs.get(i, 0.0)
                         if ready_Z > 0:
                             w = w / ready_Z
@@ -767,9 +1054,10 @@ def train_global_phase(agent, local_agent, task_ids, seen_idx, k, seed, args,
                         alpha = log_alpha.exp().item()
                         last["alpha"] = float(alpha)
 
-            # target sync (per active task) each update
-            for i in ready:
-                agent.sync_targets(i, TAU)
+            # target sync (per active task) each update; CrossQ has no targets.
+            if not crossq:
+                for i in ready:
+                    agent.sync_targets(i, TAU)
 
         # ---- stream progress / status / rolling checkpoint ----
         if reporter is not None and (iteration % log_every == 0 or iteration == num_iterations):
@@ -794,13 +1082,37 @@ def train_global_phase(agent, local_agent, task_ids, seen_idx, k, seed, args,
                             phase_eta_sec=round((time.time() - t0) * (1 - frac_done) / max(1e-9, frac_done), 1),
                             seen_tasks=[int(task_ids[i]) for i in seen_idx],
                             active_tasks=[int(task_ids[i]) for i in active])
+            if clog is not None:
+                clog.heartbeat(task_idx=k, phase="global",
+                               percent=round(100 * frac_done, 1))
         if reporter is not None and ckpt_every and iteration % ckpt_every == 0:
             reporter.checkpoint(agent, f"global_ckpt_task{k}_latest")
 
         # ---- retention check -> needy-set refresh + gated early stop ----
+        # NOTE: reported retention stays greedy-MC (deterministic_eval via
+        # det_scores_all + local_value_refs/local_success_refs); the windowed
+        # bootstrap is the TRAINING signal (shortfall Vk_G/Vk_L) ONLY.
         if iteration % args.stop_eval_every == 0:
             sc = det_scores_all()
             scores = {int(task_ids[i]): (round(sc[i][0], 3), round(sc[i][1], 3)) for i in seen_idx}
+            # ---- bootstrap-vs-MC diagnostic (CL bias check) ----
+            # VkG_MC = greedy-MC value actually reported; VkG_boot/VkL_boot = the
+            # in-phase single-critic endpoints (global rollout + local tail, and
+            # local-critic V(S_0)). The gap measures how biased the training
+            # proxy is against the reported metric. In mc mode the in-phase
+            # values ARE the mc values (compute_shortfall returns MC).
+            VkG_MC = sc[k][0]
+            VkL_MC = local_value_refs[k]
+            VkG_boot = Vk_G  # in-phase Vk_G (global rollout + local-critic tail)
+            VkL_boot = Vk_L  # in-phase Vk_L (local-critic V(S_0))
+            gap = VkG_boot - VkG_MC
+            boot_vs_mc = {
+                "kind": "boot_vs_mc", "task_idx": k, "iter": iteration,
+                "VkG_boot": VkG_boot, "VkG_MC": VkG_MC, "gap": gap,
+                "VkL_boot": VkL_boot, "VkL_MC": VkL_MC,
+            }
+            if clog is not None:
+                clog.note(json.dumps(boot_vs_mc))
             all_ok = all(
                 (sc[i][1] >= args.retention_frac * local_success_refs[i]) or
                 (sc[i][0] >= args.retention_frac * local_value_refs[i])
@@ -822,7 +1134,8 @@ def train_global_phase(agent, local_agent, task_ids, seen_idx, k, seed, args,
                                    consec=consec_ok, scores=scores,
                                    active_tasks=[int(task_ids[i]) for i in active],
                                    success_thr={int(task_ids[i]): round(args.retention_frac * local_success_refs[i], 3) for i in seen_idx},
-                                   value_thr={int(task_ids[i]): round(args.retention_frac * local_value_refs[i], 3) for i in seen_idx})
+                                   value_thr={int(task_ids[i]): round(args.retention_frac * local_value_refs[i], 3) for i in seen_idx},
+                                   boot_vs_mc=boot_vs_mc)
             if past_min and consec_ok >= args.patience:
                 logger.info(f"[global k={k}] retention-gated early stop at it={iteration}")
                 break
@@ -852,6 +1165,8 @@ def main():
     else:
         task_ids = list(range(args.num_tasks))
 
+    if getattr(args, "torch_threads", 0) and args.torch_threads > 0:
+        torch.set_num_threads(int(args.torch_threads))
     random.seed(args.seed)
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
@@ -866,7 +1181,8 @@ def main():
     act_dim = int(np.prod(probe.single_action_space.shape))
     probe.close()
 
-    agent = OursAgent(obs_dim=obs_dim, act_dim=act_dim, num_tasks=1).to(device)
+    agent = OursAgent(obs_dim=obs_dim, act_dim=act_dim, num_tasks=1,
+                      crossq=args.crossq).to(device)
 
     local_value_refs = {}
     local_success_refs = {}
@@ -876,6 +1192,55 @@ def main():
     agents_root = f"./agents/{args.tag}"
     reporter = Reporter(args.tag, agents_root, task_ids, args)
     state_path = os.path.join(reporter.run_dir, "run_state.json")
+
+    # ---- ContractLogger (ADDITIVE; separate dir so no collision with Reporter) ----
+    contract_dir = f"./data/{args.tag}/Ours/contract"
+    clog = ContractLogger(
+        contract_dir,
+        method="constrained",
+        seed=args.seed,
+        env_family="metaworld",
+        tasks=[CW20_TASKS[t] for t in task_ids],
+        task_order=",".join(str(t) for t in task_ids),
+        # reported metric is SUCCESS RATE in [0,1] -> normalization is identity.
+        reference={"random": [0.0] * len(task_ids), "ceiling": [1.0] * len(task_ids)},
+        config={"n_envs": args.n_envs, "value_mode": args.value_mode,
+                "window_H": args.window_H, "crossq": args.crossq,
+                "task1_steps": args.task1_steps, "local_steps": args.local_steps,
+                "global_iters": args.global_iters,
+                "constraint_every": args.constraint_every,
+                "tol_frac": args.tol_frac, "dual_lr": args.dual_lr,
+                "retention_frac": args.retention_frac,
+                "consolidate_mode": args.consolidate_mode},
+        frames_per_iter=0,  # frames_total is set manually per phase.
+    )
+    clog.note(f"meta-world ours; value_mode={args.value_mode}, "
+              f"crossq={args.crossq}, n_envs={args.n_envs}, window_H={args.window_H}")
+
+    # eval_matrix[k] = [greedy success on task 0..k] after task k's global phase.
+    eval_matrix = []
+    eval_matrix_path = f"./data/{args.tag}/Ours/contract/eval_matrix.json"
+
+    def set_frames_total():
+        clog.frames_total = frames_current + frames_consolidation
+
+    def end_of_phase_eval(k):
+        """Greedy-eval EVERY seen task, emit end-of-phase eval records, append the
+        row to eval_matrix, and write eval_matrix.json (crash-safe)."""
+        row = []
+        for i in range(k + 1):
+            tid = task_ids[i]
+            succ = deterministic_eval(
+                ActorHelper(agent, *_action_bounds(tid, args.seed), device),
+                tid, i, args.seed, args.eval_episodes, device, n_envs=args.n_envs)[1]
+            row.append(succ)
+            clog.eval(task_idx=k, phase="eval", it=-1, evaluated_on=i,
+                      evaluated_on_task=CW20_TASKS[tid], raw=succ,
+                      episodes=args.eval_episodes, greedy=True, seen=True)
+        eval_matrix.append(row)
+        with open(eval_matrix_path, "w") as f:
+            json.dump(eval_matrix, f, indent=2)
+        return row
 
     def save_state(last_completed):
         st = {"last_completed_task": last_completed,
@@ -905,6 +1270,10 @@ def main():
         frames_consolidation = st["frames_consolidation"]
         start_k = done + 1
         logger.info(f"[resume] loaded global_after_task{done}; continuing from task {start_k}")
+        # reload eval_matrix so end-of-phase rows aren't lost on resume.
+        if os.path.exists(eval_matrix_path):
+            with open(eval_matrix_path) as f:
+                eval_matrix.extend(json.load(f))
 
     for k, task_id in enumerate(task_ids):
         if k < start_k:
@@ -914,17 +1283,24 @@ def main():
         if k == 0:
             logger.info(f"=== Task 0 (CW20 {task_id}={CW20_TASKS[task_id]}): standard SAC -> initial global ===")
             reporter.status(task=0, task_id=task_id, phase="task0", percent=0.0)
+            clog.heartbeat(task_idx=0, phase="task1", percent=0.0)
+            clog.phase_start(task_idx=0, task=CW20_TASKS[task_id], phase="task1")
             t_ph = time.time()
             writer = make_tb_writer(args.tag, 0, args.seed, consolidation=False)
             steps = train_sac_single_task(
                 agent, task_id, 0, args.seed, args.task1_steps, device, writer,
-                reporter=reporter, phase="task0", task_k=0, save_name="global_task0")
+                reporter=reporter, phase="task0", task_k=0, save_name="global_task0",
+                clog=clog, clog_task_idx=0, clog_phase="task1")
             writer.close()
             frames_current += steps
+            set_frames_total()
+            clog.phase_end(task_idx=0, task=CW20_TASKS[task_id], phase="task1",
+                           iters=steps, frames_phase=steps,
+                           wall_s_phase=round(time.time() - t_ph, 1))
             # local reference: deterministic MC value + success of the global
             v0, s0 = deterministic_eval(
                 ActorHelper(agent, *_action_bounds(task_id, args.seed), device),
-                task_id, 0, args.seed, args.eval_episodes, device)
+                task_id, 0, args.seed, args.eval_episodes, device, n_envs=args.n_envs)
             local_value_refs[0] = v0
             local_success_refs[0] = s0
             logger.info(f"[task0] {CW20_TASKS[task_id]} local ref V={v0:.3f} success={s0:.3f}")
@@ -933,28 +1309,40 @@ def main():
                                    wall_sec=round(time.time() - t_ph, 1))
             agent.save(f"{agents_root}/global_after_task0")
             save_state(0)
+            end_of_phase_eval(0)  # end-of-phase greedy eval + eval_matrix row
             continue
 
         # ---------------- Task k>=1: LOCAL phase ----------------
         logger.info(f"=== Task {k} (CW20 {task_id}={CW20_TASKS[task_id]}): LOCAL phase (unconstrained SAC) ===")
         reporter.status(task=k, task_id=task_id, phase="local", percent=0.0)
+        clog.heartbeat(task_idx=k, phase="local", percent=0.0)
+        clog.phase_start(task_idx=k, task=CW20_TASKS[task_id], phase="local")
         t_ph = time.time()
         local_agent = agent.clone().to(device)
         local_agent.ensure_head(k)
         writer = make_tb_writer(args.tag, k, args.seed, consolidation=False)
         steps_local = train_sac_single_task(
             local_agent, task_id, k, args.seed, args.local_steps, device, writer,
-            reporter=reporter, phase="local", task_k=k, save_name=f"local_task{k}")
+            reporter=reporter, phase="local", task_k=k, save_name=f"local_task{k}",
+            clog=clog, clog_task_idx=k, clog_phase="local")
         writer.close()
         frames_current += steps_local
+        set_frames_total()
+        clog.phase_end(task_idx=k, task=CW20_TASKS[task_id], phase="local",
+                       iters=steps_local, frames_phase=steps_local,
+                       wall_s_phase=round(time.time() - t_ph, 1))
         for p in local_agent.parameters():
             p.requires_grad_(False)
         local_agent.eval()
         local_actor = ActorHelper(local_agent, *_action_bounds(task_id, args.seed), device)
         vk, sk = deterministic_eval(local_actor, task_id, k, args.seed,
-                                    args.eval_episodes, device)
+                                    args.eval_episodes, device, n_envs=args.n_envs)
         local_value_refs[k] = vk
         local_success_refs[k] = sk
+        # Bootstrap-mode Vk_L is NO LONGER precomputed here: it is the local
+        # critic's soft V(S_0), evaluated in-phase from the frozen local_agent
+        # (train_global_phase / windowed_shortfall) so BOTH shortfall endpoints
+        # share the same frozen local critic. No local rollout needed at freeze.
         logger.info(f"[task{k}] {CW20_TASKS[task_id]} LOCAL ref V={vk:.3f} success={sk:.3f}")
         local_agent.save(f"{agents_root}/local_after_task{k}")
         reporter.phase_summary(task=k, phase="local", steps=steps_local,
@@ -963,20 +1351,30 @@ def main():
 
         # ---------------- Task k>=1: GLOBAL consolidation phase ----------------
         logger.info(f"=== Task {k} (CW20 {task_id}={CW20_TASKS[task_id]}): GLOBAL consolidation ===")
+        clog.phase_start(task_idx=k, task=CW20_TASKS[task_id], phase="global")
+        t_gph = time.time()
         seen_idx = list(range(k + 1))
         cons_writers = {i: make_tb_writer(args.tag, i, args.seed, consolidation=True)
                         for i in seen_idx}
         cons_steps = train_global_phase(
             agent, local_agent, task_ids, seen_idx, k, args.seed, args, device,
-            local_value_refs, local_success_refs, cons_writers, reporter=reporter)
+            local_value_refs, local_success_refs, cons_writers, reporter=reporter,
+            clog=clog)
         for w in cons_writers.values():
             w.close()
         frames_consolidation += cons_steps
+        set_frames_total()
+        clog.phase_end(task_idx=k, task=CW20_TASKS[task_id], phase="global",
+                       iters=args.global_iters, frames_phase=cons_steps,
+                       wall_s_phase=round(time.time() - t_gph, 1))
         agent.save(f"{agents_root}/global_after_task{k}")
         save_state(k)
+        end_of_phase_eval(k)  # end-of-phase greedy eval + eval_matrix row
 
     # final global
     agent.save(f"{agents_root}/final_global")
+    clog.close()
+    close_eval_envs()  # tear down the persistent eval-env cache
 
     total = frames_current + frames_consolidation
     accounting = {

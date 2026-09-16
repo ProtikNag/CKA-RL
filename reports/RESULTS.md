@@ -8,6 +8,33 @@ visualization session.
 > `graphify-out/graph.json` exists) before reading source. Build figures via the
 > `visualization` agent / visualization-expert gate; keep the caveats in captions.
 
+## 2026-09-16 — Meta-World speedup + rerun (SUPERSEDES the "Meta running" rows below)
+
+The original Meta-World run (job 21910655) was too slow (66h → task 10/20). Replaced by
+a **speedup stack in `experiments/meta-world/run_sac_ours.py` + `models/ours.py`** (this
+commit), user-approved, code-verifier PASS, CL-expert reviewed:
+- **CrossQ critic** (`--crossq`, BN critics, no target net, joint current+next forward) —
+  the real sample-efficiency lever.
+- **Windowed critic value-gap** (`--value-mode bootstrap --window-H 200`): shortfall uses
+  the **frozen LOCAL critic for BOTH V(S_0) and V(S_H)**; only the H-step reward is rolled
+  by the current global policy: `A_k = Σ_{t<H} γ^t r_t + γ^H V_L(S_H) − V_L(S_0)`. Replaces
+  the full-episode MC constraint eval. 4-sample variance reduction.
+- **Parallel envs** (`--n-envs`, UTD-preserving) — but the demo showed **no GPU speedup**
+  (transfer/overhead-bound), so the real run uses n_envs=1.
+- **Contract logging** (`contract_logging.py`, copied from CRL-Minimax) → `data/<tag>/Ours/
+  contract/` with run.json/progress.jsonl/eval_matrix.json, so `analysis/contract_metrics.py`
+  computes PERF/FWT/BWT identically to GridWorld/Atari. Reported metric = success rate.
+
+**CL-expert flag (advisory, surfaced):** the windowed bootstrap is a *biased proxy* for the
+greedy-MC value it claims to bound (truncation + critic error). Instrumented with a live
+**boot-vs-MC diagnostic** (`kind:boot_vs_mc` notes). Retention/reported metrics stay greedy-MC.
+
+**Status:** 150k/task run FAILED (hard tasks hammer/push-wall don't learn at 150k → untrained
+critics → broken bootstrap). Now: **full 20-task @300k bootstrap (job 21921681, L40S)** running
+speculatively + a 3-way parallel validation (hammer@300k, pushwall@300k, faucet→window
+boot-vs-MC, ~3.5h). Decision rule: tasks learn + boot tracks → keep it; else switch
+`--value-mode mc` or bump budget. See memory `metaworld-speedup-design` for the full log.
+
 ## Table 1 (PERF = plasticity / end-of-task success; FWT = forward transfer)
 | Env | Ours PERF | CKA-RL | CompoNet | FT-N | Ours FWT | CKA-RL FWT |
 |---|--:|--:|--:|--:|--:|--:|
