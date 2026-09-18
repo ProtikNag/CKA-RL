@@ -295,6 +295,9 @@ def parse_args():
                    help="# sampled actions averaged for each soft state value "
                         "V(s) endpoint in --value-mode bootstrap (variance "
                         "reduction on the -alpha*log_pi soft-V estimate)")
+    p.add_argument("--fixed-alpha", type=float, default=-1.0,
+                   help="if >=0, disable SAC entropy autotune and pin alpha to this "
+                        "value (exploration knob; autotune collapses alpha on hard tasks)")
     p.add_argument("--crossq", type=_bool, default=True,
                    help="CrossQ critic (BatchNorm, no target net, joint "
                         "forward). Critic-only; actor unchanged. False -> "
@@ -635,13 +638,18 @@ def train_sac_single_task(agent, task_id, task_idx, seed, total_steps, device,
     q_betas = (0.5, 0.999) if crossq else (0.9, 0.999)
     q_optimizer = optim.Adam(q_params, lr=Q_LR, betas=q_betas)
 
-    if autotune:
+    # --fixed-alpha (>=0) disables entropy autotune and PINS alpha (exploration knob);
+    # a higher fixed alpha keeps the policy stochastic so it keeps exploring on hard
+    # contact-rich tasks where autotune collapses alpha (~0.005) into a no-reward basin.
+    fixed_alpha = getattr(reporter.args, "fixed_alpha", -1.0) if reporter else -1.0
+    if autotune and fixed_alpha < 0:
         target_entropy = -float(np.prod(envs.single_action_space.shape))
         log_alpha = torch.zeros(1, requires_grad=True, device=device)
         alpha = log_alpha.exp().item()
         a_optimizer = optim.Adam([log_alpha], lr=Q_LR)
     else:
-        alpha = 0.2
+        autotune = False
+        alpha = fixed_alpha if fixed_alpha >= 0 else 0.2
 
     # SB3 divides buffer_size by n_envs internally, so pass the FULL BUFFER_SIZE
     # (not BUFFER_SIZE//N) to keep total capacity ~constant across n_envs.
@@ -656,6 +664,10 @@ def train_sac_single_task(agent, task_id, task_idx, seed, total_steps, device,
     ep_count = 0
     t0 = time.time()
     last_actor = last_q = float("nan")
+    # best-checkpoint: snapshot the peak greedy-success weights and restore at the
+    # end, so a late collapse/oscillation (e.g. peg-unplug 1.0->0.0) doesn't cost
+    # us the learned policy. Mirrors the Atari local trainer's select-best.
+    best_succ, best_state = -1.0, None
     grad_steps = 0  # global gradient-step counter (UTD cadence, n_envs-invariant)
 
     obs, _ = envs.reset(seed=seed)
@@ -747,11 +759,22 @@ def train_sac_single_task(agent, task_id, task_idx, seed, total_steps, device,
                 and env_step % contract_eval_every < N):
             succ = deterministic_eval(actor, task_id, task_idx, seed,
                                       ce_episodes, device, n_envs=n_envs)[1]
+            if succ > best_succ:
+                best_succ = succ
+                best_state = {k: v.detach().clone() for k, v in agent.state_dict().items()}
             ti = clog_task_idx if clog_task_idx is not None else (task_k or 0)
             clog.eval(task_idx=ti, phase=(clog_phase or phase), it=int(env_step),
                       evaluated_on=ti, evaluated_on_task=CW20_TASKS[task_id],
                       raw=succ, episodes=ce_episodes, greedy=True, seen=True)
 
+    # best-checkpoint restore: if the peak greedy beat the final policy, keep the peak.
+    if best_state is not None:
+        final_succ = deterministic_eval(actor, task_id, task_idx, seed,
+                                        ce_episodes, device, n_envs=n_envs)[1]
+        if best_succ > final_succ:
+            agent.load_state_dict(best_state)
+            print(f"[best-ckpt task{task_idx}] restored peak greedy={best_succ:.3f} "
+                  f"(final was {final_succ:.3f})", flush=True)
     envs.close()
     return (total_steps // N) * N
 
@@ -926,6 +949,10 @@ def train_global_phase(agent, local_agent, task_ids, seen_idx, k, seed, args,
     num_iterations = args.global_iters
     mu = 0.0
     consec_ok = 0
+    # best-checkpoint: snapshot the model with the highest MEAN greedy success over
+    # all seen tasks (= the PERF metric) and restore it at the end, so a late
+    # consolidation collapse/drift doesn't cost retention (the Atari Boxing lesson).
+    best_ret, best_state = -1.0, None
     total_consolidation_steps = 0
     iteration_global_step = [0]  # mutable counter shared with collect_episode
 
@@ -1094,6 +1121,10 @@ def train_global_phase(agent, local_agent, task_ids, seen_idx, k, seed, args,
         # bootstrap is the TRAINING signal (shortfall Vk_G/Vk_L) ONLY.
         if iteration % args.stop_eval_every == 0:
             sc = det_scores_all()
+            mean_ret = float(np.mean([sc[i][1] for i in seen_idx]))
+            if mean_ret > best_ret:
+                best_ret = mean_ret
+                best_state = {kk: v.detach().clone() for kk, v in agent.state_dict().items()}
             scores = {int(task_ids[i]): (round(sc[i][0], 3), round(sc[i][1], 3)) for i in seen_idx}
             # ---- bootstrap-vs-MC diagnostic (CL bias check) ----
             # VkG_MC = greedy-MC value actually reported; VkG_boot/VkL_boot = the
@@ -1140,6 +1171,14 @@ def train_global_phase(agent, local_agent, task_ids, seen_idx, k, seed, args,
                 logger.info(f"[global k={k}] retention-gated early stop at it={iteration}")
                 break
 
+    # best-checkpoint restore: keep the peak mean-success model over this phase.
+    if best_state is not None:
+        final_sc = det_scores_all()
+        final_ret = float(np.mean([final_sc[i][1] for i in seen_idx]))
+        if best_ret > final_ret:
+            agent.load_state_dict(best_state)
+            logger.info(f"[global k={k}] best-ckpt restored mean_success={best_ret:.3f} "
+                        f"(final was {final_ret:.3f})")
     for i in list(envs_by_idx.keys()):
         close_task(i)
     if reporter is not None:

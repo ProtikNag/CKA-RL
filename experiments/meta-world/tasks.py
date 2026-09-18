@@ -1,4 +1,5 @@
 import numpy as np
+import os
 
 single_tasks = [
     "hammer-v2",
@@ -45,7 +46,10 @@ def get_task(task_id, render=False):
 
     if render:
         env.render_mode = "human"
-    env._freeze_rand_vec = False
+    # DIAGNOSTIC ONLY: MW_FREEZE_GOAL=1 fixes the goal (MT1-style) to test whether
+    # goal-randomization is why flat SAC fails hard tasks. Must stay 0 for the
+    # reported benchmark (baselines use randomized goals). Default: randomized.
+    env._freeze_rand_vec = os.environ.get("MW_FREEZE_GOAL", "0") == "1"
 
     return env
 
