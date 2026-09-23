@@ -146,6 +146,10 @@ def parse_args():
     p.add_argument("--cuda", type=lambda v: str(v).lower() in ("1", "true", "yes", "y"),
                    default=True)
     p.add_argument("--debug", action="store_true")
+    p.add_argument("--shared-head", type=lambda v: str(v).lower() in ("1", "true", "yes", "y"),
+                   default=False,
+                   help="ONE shared actor+critic head for all modes (matches authors' "
+                        "single-head design). Default False = per-mode heads.")
     return p.parse_args()
 
 
@@ -806,7 +810,9 @@ def main():
 
     # build a probe env just for action space to construct the agent
     probe = build_envs(args.env_id, modes[0], args.seed, "probe")
-    agent = OursAgent(probe, num_tasks=1).to(device)
+    agent = OursAgent(probe, num_tasks=1, shared_head=args.shared_head).to(device)
+    logger.info(f"shared_head={args.shared_head} "
+                f"({'ONE head for all modes (authors-matched)' if args.shared_head else 'per-mode heads'})")
     probe.close()
 
     local_refs = {}   # task_idx -> local reference greedy-100 score
